@@ -1,0 +1,43 @@
+# Content files
+story.txt
+chap-01.txt
+improved_text.txt
+bad_lines.txt
+ai_written_lines.txt
+not_ai.txt
+
+# Cache directories
+.model_cache/
+.hebrew_model_cache/
+__pycache__/
+*.py[cod]
+*$py.class
+
+#Model files
+*.gguf
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+
+# Virtual environments
+venv/
+env/
+ENV/
+
+# IDE files
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS specific files
+.DS_Store
+Thumbs.db
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# Log files
+*.log

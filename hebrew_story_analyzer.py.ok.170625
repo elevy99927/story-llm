@@ -1,0 +1,516 @@
+#!/usr/bin/env python3
+"""
+Hebrew Story Analyzer - Analyzes Hebrew text stories using specialized models
+Based on the original story_analyzer but optimized for Hebrew text
+"""
+
+import argparse
+import os
+import re
+import statistics
+import random
+from typing import Dict, Any, List, Tuple
+import time
+import pickle
+import hashlib
+
+# ===== Configuration Parameters =====
+# These parameters can be adjusted to fine-tune the analysis
+
+# AI Detection thresholds
+AI_SCORE_THRESHOLD = 3        # Minimum score to consider text as AI-written
+GENERIC_PHRASE_WEIGHT = 0.1     # Weight (10%) added for generic phrases
+WORD_LENGTH_RANGE = (10, 25)    # Range of words in sentence that might indicate AI
+LEXICAL_DIVERSITY_THRESHOLD = 0.68  # Threshold for lexical diversity (lower = more likely AI)
+PUNCTUATION_RANGE = (0.06, 0.14)    # Range of punctuation ratio that might indicate AI
+
+# Cache settings
+USE_CACHE = True                # Whether to use cache for model results
+CACHE_DIR = '.hebrew_model_cache'  # Directory to store cached results
+
+# Model settings
+DEFAULT_BERT_MODEL = "avichr/heBERT_sentiment_analysis"  # Default Hebrew BERT model
+DEFAULT_NER_MODEL = "onlplab/alephbert-base"            # Default Hebrew NER model
+DEFAULT_SUMMARY_MODEL = "google/mt5-small"              # Default summarization model
+
+def load_text(file_path: str) -> str:
+    """Load text from a file with Hebrew encoding support."""
+    try:
+        with open(file_path, 'r', encoding='utf-8') as file:
+            return file.read()
+    except UnicodeDecodeError:
+        # Try with a different encoding if utf-8 fails
+        try:
+            with open(file_path, 'r', encoding='cp1255') as file:  # Hebrew Windows encoding
+                return file.read()
+        except UnicodeDecodeError:
+            with open(file_path, 'r', encoding='iso-8859-8') as file:  # Another Hebrew encoding
+                return file.read()
+    except Exception as e:
+        print(f"Error loading file: {e}")
+        exit(1)
+
+def get_cache_dir():
+    """Get or create cache directory for models."""
+    cache_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), CACHE_DIR)
+    os.makedirs(cache_dir, exist_ok=True)
+    return cache_dir
+
+def get_model_hash(model_path):
+    """Generate a hash for the model file to use in cache keys."""
+    if not model_path or not os.path.exists(model_path):
+        return "default"
+    
+    # Use file modification time and size for quick hash
+    stat = os.stat(model_path)
+    return f"{os.path.basename(model_path)}_{stat.st_mtime}_{stat.st_size}"
+
+def analyze_with_hebrew_bert(text: str, model_name: str = DEFAULT_BERT_MODEL) -> Dict[str, Any]:
+    """Analyze Hebrew text using HeBERT model."""
+    try:
+        from transformers import pipeline, AutoTokenizer, AutoModelForSequenceClassification
+        import torch
+        
+        # Create a hash of the text to use as cache key
+        text_hash = hashlib.md5(text[:1000].encode()).hexdigest()
+        cache_key = f"hebert_{text_hash}"
+        cache_file = os.path.join(get_cache_dir(), f"{cache_key}.pkl")
+        
+        # Check if we have cached results
+        if USE_CACHE and os.path.exists(cache_file):
+            print(f"Loading cached HeBERT analysis results...")
+            try:
+                with open(cache_file, 'rb') as f:
+                    return pickle.load(f)
+            except Exception as e:
+                print(f"Error loading cache: {e}. Will recompute.")
+        
+        results = {
+            "summary": "",
+            "sentiment": "",
+            "themes": [],
+            "key_entities": []
+        }
+        
+        print(f"Loading Hebrew models (HeBERT, AlephBERT, mT5)...")
+        
+        # Sentiment analysis using HeBERT
+        try:
+            print("Loading HeBERT for sentiment analysis...")
+            sentiment_analyzer = pipeline("sentiment-analysis", model=model_name)
+        except Exception as e:
+            print(f"Error loading HeBERT: {e}, falling back to multilingual model")
+            try:
+                sentiment_analyzer = pipeline("sentiment-analysis", model="nlptown/bert-base-multilingual-uncased-sentiment")
+            except:
+                sentiment_analyzer = pipeline("sentiment-analysis")  # Fallback to default
+        
+        # Named entity recognition using AlephBERT
+        try:
+            print("Loading AlephBERT for entity recognition...")
+            ner = pipeline("ner", model=DEFAULT_NER_MODEL)
+        except Exception as e:
+            print(f"Error loading AlephBERT: {e}, falling back to multilingual model")
+            try:
+                ner = pipeline("ner", model="xlm-roberta-large-finetuned-conll03-english")
+            except:
+                ner = pipeline("ner")  # Fallback to default
+        
+        # Break text into manageable chunks
+        chunk_size = 500  # BERT typically handles 512 tokens max
+        chunks = [text[i:i+chunk_size] for i in range(0, len(text), chunk_size)]
+        
+        print("Analyzing sentiment...")
+        # Analyze sentiment on first few chunks
+        sentiments = []
+        for i, chunk in enumerate(chunks[:5]):  # Limit to first 5 chunks for speed
+            if chunk.strip():
+                sentiment = sentiment_analyzer(chunk)[0]
+                sentiments.append(sentiment)
+                
+        # Determine overall sentiment
+        pos_count = sum(1 for s in sentiments if s['label'] == 'POSITIVE')
+        neg_count = len(sentiments) - pos_count
+        results["sentiment"] = "חיובי" if pos_count > neg_count else "שלילי"
+        
+        print("Extracting entities...")
+        # Extract entities from first few chunks
+        entities = {}
+        for i, chunk in enumerate(chunks[:3]):  # Limit to first 3 chunks for speed
+            if chunk.strip():
+                chunk_entities = ner(chunk)
+                
+                # Group consecutive entity tokens to form complete words
+                current_entity = ""
+                for entity in chunk_entities:
+                    # Remove the underscore prefix that indicates start of word in some tokenizers
+                    word = entity['word'].replace('##', '').replace('▁', '')
+                    
+                    if entity['entity'].startswith('B-'):  # Beginning of entity
+                        if current_entity:  # Save previous entity if exists
+                            entities[current_entity] = entities.get(current_entity, 0) + 1
+                        current_entity = word
+                    elif entity['entity'].startswith('I-'):  # Inside/continuation of entity
+                        current_entity += word
+                    else:  # Not part of a named entity
+                        if current_entity:  # Save previous entity if exists
+                            entities[current_entity] = entities.get(current_entity, 0) + 1
+                            current_entity = ""
+                
+                # Don't forget the last entity
+                if current_entity:
+                    entities[current_entity] = entities.get(current_entity, 0) + 1
+        
+        # Filter out very short entities (likely fragments)
+        entities = {k: v for k, v in entities.items() if len(k) >= 2}
+        
+        # Get top entities
+        results["key_entities"] = [k for k, v in sorted(entities.items(), key=lambda x: x[1], reverse=True)[:10]]
+        
+        print("Generating summary...")
+        # Generate summary using mT5
+        if len(chunks[0]) > 100:  # Ensure there's enough text to summarize
+            try:
+                from transformers import MT5ForConditionalGeneration, MT5Tokenizer
+                
+                print("Using mT5 model for Hebrew summarization...")
+                tokenizer = MT5Tokenizer.from_pretrained(DEFAULT_SUMMARY_MODEL)
+                model = MT5ForConditionalGeneration.from_pretrained(DEFAULT_SUMMARY_MODEL)
+                
+                # Use Hebrew prompt
+                prefix = "סכם את הטקסט הבא בעברית: "  # "Summarize the following text in Hebrew: "
+                
+                inputs = tokenizer(prefix + chunks[0], return_tensors="pt", max_length=512, truncation=True)
+                summary_ids = model.generate(
+                    inputs.input_ids, 
+                    max_length=150, 
+                    min_length=40, 
+                    length_penalty=2.0,
+                    num_beams=4,
+                    temperature=0.8
+                )
+                results["summary"] = tokenizer.decode(summary_ids[0], skip_special_tokens=True)
+            except Exception as e:
+                print(f"Error with mT5 summarization: {e}, falling back to default")
+                try:
+                    summarizer = pipeline("summarization")
+                    summary = summarizer(chunks[0], max_length=100, min_length=30, do_sample=False)
+                    results["summary"] = summary[0]['summary_text']
+                except Exception as e2:
+                    print(f"Error with summarization: {e2}")
+                    results["summary"] = "לא ניתן לייצר סיכום."  # "Could not generate summary."
+        
+        # Cache the results
+        if USE_CACHE:
+            try:
+                with open(cache_file, 'wb') as f:
+                    pickle.dump(results, f)
+                print(f"Saved results to cache for faster future analysis")
+            except Exception as e:
+                print(f"Warning: Could not save to cache: {e}")
+            
+        return results
+        
+    except ImportError:
+        print("HeBERT analysis requires transformers package.")
+        print("Install with: pip install transformers torch")
+        exit(1)
+    except Exception as e:
+        print(f"Error analyzing with HeBERT: {e}")
+        exit(1)
+
+def detect_ai_written_text(text: str) -> Tuple[List[str], Dict[str, Any]]:
+    """
+    Detect lines that were likely written by AI, optimized for Hebrew text.
+    Returns a list of AI-written lines and detection metrics.
+    """
+    print("Running AI text detector for Hebrew text...")
+    
+    # Load whitelist of known human-written lines
+    whitelist = set()
+    try:
+        if os.path.exists('not_ai.txt'):
+            with open('not_ai.txt', 'r', encoding='utf-8') as f:
+                whitelist = {line.strip() for line in f.readlines() if line.strip()}
+            print(f"Loaded {len(whitelist)} whitelisted lines from not_ai.txt")
+    except Exception as e:
+        print(f"Warning: Could not load not_ai.txt: {e}")
+    
+    # Load generic phrases from file
+    generic_phrases = []
+    try:
+        phrases_file = 'generic_phrases.txt'
+        if os.path.exists(phrases_file):
+            with open(phrases_file, 'r', encoding='utf-8') as f:
+                for line in f:
+                    line = line.strip()
+                    # Skip empty lines and comments
+                    if line and not line.startswith('#'):
+                        generic_phrases.append(line)
+            print(f"Loaded {len(generic_phrases)} generic phrases from {phrases_file}")
+        else:
+            # Fallback to default Hebrew phrases
+            generic_phrases = [
+                'חשוב לציין', 'ניתן לראות', 'לסיכום', 'מצד שני', 
+                'לסכם', 'בנוסף', 'יתרה מזאת', 'באופן כללי',
+                'על פי הנתונים', 'יש לקחת בחשבון', 'מבחינה טכנית',
+                'כפי שציינתי'
+            ]
+            print(f"Warning: {phrases_file} not found, using default Hebrew phrases")
+    except Exception as e:
+        print(f"Error loading generic phrases: {e}, using default phrases")
+        generic_phrases = [
+            'חשוב לציין', 'ניתן לראות', 'לסיכום', 'מצד שני', 
+            'לסכם', 'בנוסף', 'יתרה מזאת'
+        ]
+    
+    # Split text into lines
+    lines = [line.strip() for line in text.split('\n') if line.strip()]
+    
+    # Features that often indicate AI-generated text
+    ai_indicators = []
+    ai_written_lines = []
+    
+    for line in lines:
+        if len(line) < 3:  # Skip very short lines
+            continue
+            
+        # Calculate features that may indicate AI-generated text
+        score = 0
+        reasons = []
+        
+        # 1. Excessive precision and formality
+        words = re.findall(r'[\w\u0590-\u05FF]+', line)  # Include Hebrew Unicode range
+        if not words:
+            continue
+            
+        # Check for unnaturally consistent sentence length
+        min_words, max_words = WORD_LENGTH_RANGE
+        if min_words <= len(words) <= max_words:
+            score += 1
+            reasons.append("אורך משפט עקבי")  # "consistent length"
+            
+        # 2. Check for repetitive phrases or patterns
+        word_set = set(words)
+        if len(word_set) / len(words) < LEXICAL_DIVERSITY_THRESHOLD:  # Low lexical diversity
+            score += 1
+            reasons.append("גיוון לקסיקלי נמוך")  # "low lexical diversity"
+            
+        # 3. Check for overly balanced punctuation
+        punct_count = len(re.findall(r'[.,;:!?،؛]', line))  # Include Arabic punctuation
+        min_punct, max_punct = PUNCTUATION_RANGE
+        if min_punct <= punct_count / len(line) <= max_punct:  # Suspiciously balanced punctuation
+            score += 1
+            reasons.append("פיסוק מאוזן")  # "balanced punctuation"
+            
+        # 4. Check for lack of informal elements
+        if not re.search(r'(!{2,}|\?{2,}|\.{3,})', line):  # No multiple exclamation/question marks or ellipses
+            score += 0.5
+            
+        # 5. Check for perfect grammatical structure (simplified check)
+        if not re.search(r'\b(אה|אממ|כאילו|נו|טוב|יאללה|אז|בקיצור)\b', line.lower()):
+            score += 0.5
+            
+        # 6. Check for generic phrasing - add 10% to score for each match
+        for phrase in generic_phrases:
+            if phrase.lower() in line.lower():
+                phrase_score = GENERIC_PHRASE_WEIGHT * score  # Add 10% to current score
+                score += phrase_score
+                reasons.append(f"ביטוי גנרי: '{phrase}'")  # "generic phrase"
+                break
+                
+        # Store results if score is high enough and line is not in whitelist
+        if score >= AI_SCORE_THRESHOLD and line not in whitelist:
+            ai_indicators.append({
+                'line': line,
+                'score': score,
+                'reasons': reasons
+            })
+            ai_written_lines.append(line)
+    
+    # Save AI-written lines to file
+    with open('ai_written_lines.txt', 'w', encoding='utf-8') as f:
+        f.write("שורות שכנראה נכתבו על ידי בינה מלאכותית:\n\n")  # "Lines likely written by AI"
+        # Sort and remove duplicates
+        unique_lines = sorted(set(ai_written_lines))
+        for line in unique_lines:
+            if not line.strip() or len(line) < 4:  # Skip empty or very short lines
+                continue
+            f.write(line + '\n')
+    
+    ai_detection_info = {
+        'ai_written_lines_count': len(ai_written_lines),
+        'total_lines_analyzed': len(lines),
+        'percentage_ai': round(len(ai_written_lines) / len(lines) * 100, 2) if lines else 0
+    }
+    
+    return ai_written_lines, ai_detection_info
+
+def analyze_writing_style(text: str) -> Tuple[List[str], Dict[str, Any]]:
+    """
+    Analyze writing style and identify lines that don't match the main style.
+    Optimized for Hebrew text.
+    """
+    print("Analyzing Hebrew writing style...")
+    
+    # Split text into lines
+    lines = [line.strip() for line in text.split('\n') if line.strip()]
+    
+    # Calculate style metrics for each line
+    metrics = []
+    for line in lines:
+        if len(line) < 3:  # Skip very short lines
+            continue
+            
+        # Calculate basic metrics - use a pattern that works with Hebrew
+        words = re.findall(r'[\w\u0590-\u05FF]+', line)  # Include Hebrew Unicode range
+        if not words:
+            continue
+            
+        avg_word_len = sum(len(word) for word in words) / len(words) if words else 0
+        sentence_len = len(words)
+        punctuation_count = len(re.findall(r'[.,;:!?،؛]', line))  # Include Arabic punctuation
+        
+        metrics.append({
+            'line': line,
+            'avg_word_len': avg_word_len,
+            'sentence_len': sentence_len,
+            'punctuation_ratio': punctuation_count / len(line) if len(line) > 0 else 0
+        })
+    
+    if not metrics:
+        return [], {'error': 'לא מספיק טקסט לניתוח סגנון'}  # "Not enough text to analyze style"
+    
+    # Calculate average metrics to determine the main style
+    avg_word_lengths = [m['avg_word_len'] for m in metrics]
+    avg_sentence_lengths = [m['sentence_len'] for m in metrics]
+    avg_punct_ratios = [m['punctuation_ratio'] for m in metrics]
+    
+    # Calculate mean and standard deviation
+    mean_word_len = statistics.mean(avg_word_lengths)
+    stdev_word_len = statistics.stdev(avg_word_lengths) if len(avg_word_lengths) > 1 else 0
+    
+    mean_sent_len = statistics.mean(avg_sentence_lengths)
+    stdev_sent_len = statistics.stdev(avg_sentence_lengths) if len(avg_sentence_lengths) > 1 else 0
+    
+    mean_punct_ratio = statistics.mean(avg_punct_ratios)
+    stdev_punct_ratio = statistics.stdev(avg_punct_ratios) if len(avg_punct_ratios) > 1 else 0
+    
+    # Identify outliers (lines that don't match the main style)
+    outliers = []
+    for m in metrics:
+        # Check if metrics are outside 2 standard deviations
+        is_outlier = False
+        
+        if stdev_word_len > 0 and abs(m['avg_word_len'] - mean_word_len) > 2 * stdev_word_len:
+            is_outlier = True
+        
+        if stdev_sent_len > 0 and abs(m['sentence_len'] - mean_sent_len) > 2 * stdev_sent_len:
+            is_outlier = True
+            
+        if stdev_punct_ratio > 0 and abs(m['punctuation_ratio'] - mean_punct_ratio) > 2 * stdev_punct_ratio:
+            is_outlier = True
+            
+        if is_outlier:
+            outliers.append(m['line'])
+    
+    # Save outliers to file
+    with open('bad_lines.txt', 'w', encoding='utf-8') as f:
+        f.write("שורות שלא תואמות את סגנון הכתיבה העיקרי:\n\n")  # "Lines that don't match the main writing style"
+        for line in outliers:
+            f.write(line + '\n\n')
+    
+    style_info = {
+        'avg_word_length': mean_word_len,
+        'avg_sentence_length': mean_sent_len,
+        'avg_punctuation_ratio': mean_punct_ratio,
+        'inconsistent_lines_count': len(outliers),
+        'total_lines_analyzed': len(metrics)
+    }
+    
+    return outliers, style_info
+
+def main():
+    # Declare globals at the beginning of the function
+    global USE_CACHE, AI_SCORE_THRESHOLD
+    
+    parser = argparse.ArgumentParser(description='Analyze Hebrew text stories using specialized models')
+    parser.add_argument('file', help='Path to the text file containing the story')
+    parser.add_argument('--model', choices=['hebert', 'alephbert'], default='hebert',
+                        help='Model to use for analysis (default: hebert)')
+    parser.add_argument('--analyze-style', action='store_true',
+                        help='Analyze writing style and identify inconsistent lines')
+    parser.add_argument('--detect-ai', action='store_true',
+                        help='Detect lines likely written by AI')
+    parser.add_argument('--no-cache', action='store_true',
+                        help='Disable caching of model results')
+    parser.add_argument('--threshold', type=float, default=AI_SCORE_THRESHOLD,
+                        help=f'Threshold for AI detection (default: {AI_SCORE_THRESHOLD})')
+    
+    args = parser.parse_args()
+    
+    # Update global settings based on arguments
+    USE_CACHE = not args.no_cache
+    AI_SCORE_THRESHOLD = args.threshold
+    
+    if not os.path.exists(args.file):
+        print(f"Error: File '{args.file}' not found")
+        exit(1)
+    
+    print(f"Loading text from {args.file}...")
+    text = load_text(args.file)
+    print(f"Loaded {len(text)} characters ({len(text.split())} words)")
+    
+    # Check if text contains Hebrew
+    has_hebrew = any('\u0590' <= c <= '\u05FF' for c in text[:1000])
+    if not has_hebrew:
+        print("Warning: No Hebrew characters detected in the first 1000 characters.")
+        print("This tool is optimized for Hebrew text. Results may not be accurate.")
+    
+    start_time = time.time()
+    
+    # Analyze writing style if requested
+    if args.analyze_style:
+        outliers, style_info = analyze_writing_style(text)
+    
+    # Detect AI-written text if requested
+    if args.detect_ai:
+        ai_lines, ai_info = detect_ai_written_text(text)
+    
+    # Analyze text with Hebrew models
+    if args.model == 'alephbert':
+        results = analyze_with_hebrew_bert(text, model_name=DEFAULT_NER_MODEL)
+    else:  # hebert
+        results = analyze_with_hebrew_bert(text)
+    
+    elapsed_time = time.time() - start_time
+    
+    print("\n" + "="*50)
+    print(f"Analysis completed in {elapsed_time:.2f} seconds")
+    print("="*50)
+    
+    if "summary" in results and results["summary"]:
+        print(f"\nסיכום:\n{results['summary']}")  # "Summary"
+    
+    if "sentiment" in results and results["sentiment"]:
+        print(f"\nרגש כללי: {results['sentiment']}")  # "Overall Sentiment"
+    
+    if "key_entities" in results and results["key_entities"]:
+        print(f"\nישויות מרכזיות: {', '.join(results['key_entities'])}")  # "Key Entities"
+    
+    # Print style analysis results if available
+    if 'style_info' in locals():
+        print("\nניתוח סגנון כתיבה:")  # "Writing Style Analysis"
+        print(f"- אורך מילה ממוצע: {style_info['avg_word_length']:.2f} תווים")  # "Average word length: X characters"
+        print(f"- אורך משפט ממוצע: {style_info['avg_sentence_length']:.2f} מילים")  # "Average sentence length: X words"
+        print(f"- שורות לא עקביות: {style_info['inconsistent_lines_count']} מתוך {style_info['total_lines_analyzed']}")  # "Inconsistent lines: X out of Y"
+        print(f"- שורות לא עקביות נשמרו לקובץ bad_lines.txt")  # "Inconsistent lines saved to bad_lines.txt"
+    
+    # Print AI detection results if available
+    if 'ai_info' in locals():
+        print("\nזיהוי טקסט AI:")  # "AI Text Detection"
+        print(f"- שורות שנכתבו על ידי AI: {ai_info['ai_written_lines_count']} מתוך {ai_info['total_lines_analyzed']} ({ai_info['percentage_ai']}%)")  # "AI-written lines: X out of Y (Z%)"
+        print(f"- שורות שנכתבו על ידי AI נשמרו לקובץ ai_written_lines.txt")  # "AI-written lines saved to ai_written_lines.txt"
+    
+if __name__ == "__main__":
+    main()

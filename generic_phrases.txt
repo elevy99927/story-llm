@@ -1,0 +1,24 @@
+# English phrases
+it is important to note
+as we can see
+in conclusion
+on the other hand
+in summary
+to summarize
+
+# Hebrew phrases
+חשוב לציין
+ניתן לראות
+לסיכום
+מצד שני
+לסכם
+בנוסף
+יתרה מזאת
+באופן כללי
+על פי הנתונים
+יש לקחת בחשבון
+מבחינה טכנית
+כפי שציינתי
+מדי
+
+
