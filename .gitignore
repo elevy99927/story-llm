@@ -36,6 +36,7 @@ ENV/
 # OS specific files
 .DS_Store
 Thumbs.db
+Miniconda3-latest-MacOSX-x86_64.sh
 
 # Jupyter Notebook
 .ipynb_checkpoints
